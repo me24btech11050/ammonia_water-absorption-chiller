@@ -27,3 +27,6 @@ jobs:
       - name: Run tests
         run: |
           PYTHONPATH=. pytest -q
+      - name: Run project
+        run: |
+          PYTHONPATH=. python scripts/run_project.py
