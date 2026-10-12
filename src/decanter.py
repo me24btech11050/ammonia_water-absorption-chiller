@@ -1,16 +1,66 @@
-"""Condensate/decanter calculations."""
+"""Preliminary condensate collection calculations."""
 
-def condensate_rate_per_zone(m_da_kg_s, w_mix, w_supply):
-    """kg/s of condensate at the cooling coil."""
-    return max(m_da_kg_s * (w_mix - w_supply), 0.0)
+from src.psychrometrics import humidity_ratio, mix_air
 
-
-def district_condensate(m_da_kg_s, w_mix, w_supply, n_zones=400):
-    mdot = condensate_rate_per_zone(m_da_kg_s, w_mix, w_supply)
-    kg_h = mdot * 3600.0 * n_zones
-    m3_day = kg_h * 24.0 / 1000.0
-    return {"kg_h": kg_h, "m3_day": m3_day}
+N_ZONES = 400
+ZONES_PER_RISER = 20
+M_DA_ZONE = 0.40
+BYPASS_FACTOR = 0.15
+COIL_ADP_C = 7.0
 
 
-def riser_count(n_zones=400, zones_per_riser=20):
-    return (n_zones + zones_per_riser - 1) // zones_per_riser
+def condensate_rate_kg_s(m_da, w_in, w_out):
+    """Condensate rate from the dry-air moisture balance."""
+    return max(0.0, m_da * (w_in - w_out))
+
+
+def estimate_condensate(
+    T_out,
+    RH_out,
+    T_room=22.0,
+    RH_room=0.60,
+    fresh_fraction=0.30,
+):
+    """Estimate condensate using a specified coil ADP."""
+    mixed = mix_air(
+        T_room,
+        RH_room,
+        T_out,
+        RH_out,
+        1.0 - fresh_fraction,
+    )
+
+    w_adp = humidity_ratio(COIL_ADP_C, 1.0)
+    w_supply = (
+        w_adp + BYPASS_FACTOR * (mixed["w"] - w_adp)
+    )
+
+    per_zone = condensate_rate_kg_s(
+        M_DA_ZONE, mixed["w"], w_supply
+    )
+
+    district = per_zone * N_ZONES
+
+    return {
+        "T_out_C": T_out,
+        "RH_out": RH_out,
+        "condensate_zone_kg_h": per_zone * 3600,
+        "condensate_district_kg_h": district * 3600,
+        "district_m3_day": district * 86400 / 1000,
+        "number_of_risers": N_ZONES // ZONES_PER_RISER,
+    }
+
+
+if __name__ == "__main__":
+    cases = [
+        ("Summer day", 40.0, 0.50),
+        ("Summer night", 30.0, 0.50),
+        ("Monsoon day", 35.0, 0.85),
+        ("Monsoon night", 30.0, 0.85),
+        ("Winter day", 28.0, 0.50),
+        ("Winter night", 16.0, 0.50),
+    ]
+
+    for name, T, RH in cases:
+        result = estimate_condensate(T, RH)
+        print(name, result)
