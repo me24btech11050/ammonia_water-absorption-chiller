@@ -1,145 +1,165 @@
-"""Pure-ammonia Peng–Robinson EOS and saturation-pressure routines.
-
-The project requires ammonia to be treated with a real-gas EOS rather than
-a black-box ammonia property library.
-"""
+"""Peng-Robinson equation of state utilities for ammonia."""
 
 import math
-from dataclasses import dataclass
+import numpy as np
+from scipy.optimize import brentq
 
-R = 8.314462618  # J/mol/K
-MW_NH3 = 17.031e-3  # kg/mol
-TC = 405.56       # K
-PC = 11.333e6     # Pa
+R = 8.314462618
+TC = 405.56
+PC = 11.333e6
 OMEGA = 0.256
+MW = 0.017031
 
 
-def lee_kesler_pitzer_psat(T_K: float) -> float:
-    """Generalized Pitzer/Lee-Kesler vapour-pressure correlation, Pa."""
-    Tr = T_K / TC
-    if Tr <= 0:
-        raise ValueError("Temperature must be positive.")
-    if Tr >= 1:
-        return PC
-
-    ln_Pr0 = (
-        5.92714
-        - 6.09648 / Tr
-        - 1.28862 * math.log(Tr)
-        + 0.169347 * Tr**6
+def pr_parameters(T):
+    kappa = (
+        0.37464 + 1.54226 * OMEGA
+        - 0.26992 * OMEGA**2
     )
-    ln_Pr1 = (
-        15.2518
-        - 15.6875 / Tr
-        - 13.4721 * math.log(Tr)
-        + 0.43577 * Tr**6
-    )
-    return PC * math.exp(ln_Pr0 + OMEGA * ln_Pr1)
+    alpha = (
+        1 + kappa * (1 - math.sqrt(T / TC))
+    )**2
 
-
-def psat_nh3(T_C: float) -> float:
-    return lee_kesler_pitzer_psat(T_C + 273.15)
-
-
-def _pr_parameters(T_K):
-    kappa = 0.37464 + 1.54226 * OMEGA - 0.26992 * OMEGA**2
-    alpha = (1 + kappa * (1 - math.sqrt(T_K / TC)))**2
     a = 0.45724 * R**2 * TC**2 / PC * alpha
     b = 0.07780 * R * TC / PC
     return a, b
 
 
-def _z_roots(T_K, P_Pa):
-    a, b = _pr_parameters(T_K)
-    A = a * P_Pa / (R**2 * T_K**2)
-    B = b * P_Pa / (R * T_K)
+def pr_roots(T, P):
+    a, b = pr_parameters(T)
+    A = a * P / (R**2 * T**2)
+    B = b * P / (R * T)
 
-    coeff = [
+    roots = np.roots([
         1.0,
-        -(1.0 - B),
-        A - 3.0 * B**2 - 2.0 * B,
+        -(1 - B),
+        A - 3 * B**2 - 2 * B,
         -(A * B - B**2 - B**3),
-    ]
-    roots = np_roots_real(coeff)
-    return sorted(roots), A, B
+    ])
 
-
-def np_roots_real(coeff):
-    # Local import keeps this module lightweight.
-    import numpy as np
-    roots = np.roots(coeff)
-    return [float(r.real) for r in roots if abs(float(r.imag)) < 1e-8]
-
-
-def z_factor(T_K, P_Pa, phase="vapor"):
-    roots, _, _ = _z_roots(T_K, P_Pa)
-    if not roots:
-        raise RuntimeError("No real Peng–Robinson Z root.")
-    return max(roots) if phase == "vapor" else min(roots)
-
-
-def ideal_cp_nh3(T_K):
-    # Smooth engineering approximation around the project operating range.
-    # Used only for the ideal-gas contribution; departure is supplied by PR.
-    return 35.06 + 0.0105 * (T_K - 273.15)  # J/mol/K
-
-
-def ideal_h_nh3(T_K, T_ref=273.15):
-    a = 35.06
-    b = 0.0105
-    return (a * (T_K - T_ref) + 0.5 * b *
-            ((T_K - 273.15)**2 - (T_ref - 273.15)**2)) / MW_NH3
-
-
-def pr_enthalpy_departure(T_K, P_Pa, phase="vapor"):
-    """PR enthalpy departure in kJ/kg."""
-    a, b = _pr_parameters(T_K)
-    Z = z_factor(T_K, P_Pa, phase)
-    _, _, B = _z_roots(T_K, P_Pa)
-
-    # Numerical derivative of a(T) is sufficiently stable for this model.
-    dT = max(1e-3, 1e-4 * T_K)
-    ap, _ = _pr_parameters(T_K + dT)
-    am, _ = _pr_parameters(T_K - dT)
-    da_dT = (ap - am) / (2 * dT)
-
-    sqrt2 = math.sqrt(2.0)
-    term_log = math.log(
-        (Z + (1 + sqrt2) * B) /
-        (Z + (1 - sqrt2) * B)
+    real = sorted(
+        float(z.real) for z in roots
+        if abs(z.imag) < 1e-8 and z.real > B
     )
-    hdep_molar = (
-        R * T_K * (Z - 1.0)
-        + (T_K * da_dT - a) /
-        (2.0 * sqrt2 * b) * term_log
+
+    if not real:
+        raise ValueError("No physical EOS root.")
+
+    return real
+
+
+def ln_fugacity_coefficient(Z, A, B):
+    s2 = math.sqrt(2)
+
+    return (
+        Z - 1 - math.log(Z - B)
+        - A / (2 * s2 * B)
+        * math.log(
+            (Z + (1 + s2) * B)
+            / (Z + (1 - s2) * B)
+        )
     )
-    return hdep_molar / 1000.0 / MW_NH3
 
 
-def nh3_enthalpy(T_C, P_kPa, phase="vapor"):
-    T_K = T_C + 273.15
-    P_Pa = P_kPa * 1000.0
-    return ideal_h_nh3(T_K) + pr_enthalpy_departure(T_K, P_Pa, phase)
+def saturation_pressure(T):
+    """Approximate ammonia saturation pressure in Pa."""
+    if not 195.0 < T < TC:
+        raise ValueError("Temperature outside supported range.")
+
+    def residual(logP):
+        P = math.exp(logP)
+        a, b = pr_parameters(T)
+        A = a * P / (R**2 * T**2)
+        B = b * P / (R * T)
+
+        roots = pr_roots(T, P)
+
+        if len(roots) < 2:
+            return float("nan")
+
+        return (
+            ln_fugacity_coefficient(roots[-1], A, B)
+            - ln_fugacity_coefficient(roots[0], A, B)
+        )
+
+    grid = np.linspace(math.log(1e3), math.log(PC * 0.999), 400)
+    previous_x = grid[0]
+    previous_y = residual(previous_x)
+
+    for x in grid[1:]:
+        y = residual(x)
+
+        if math.isfinite(previous_y) and math.isfinite(y):
+            if previous_y * y < 0:
+                return math.exp(brentq(residual, previous_x, x))
+
+        previous_x, previous_y = x, y
+
+    # Corresponding-states fallback; less accurate than EOS fugacity equality.
+    Tr = T / TC
+    return PC * math.exp(5.373 * (1 + OMEGA) * (1 - 1 / Tr))
 
 
-def nh3_entropy(T_C, P_kPa, phase="vapor"):
-    """Approximate entropy from ideal-gas contribution + PR pressure correction."""
-    T_K = T_C + 273.15
-    P_Pa = P_kPa * 1000.0
-    cp = ideal_cp_nh3(T_K)
-    s_ideal = (
-        cp * math.log(T_K / 273.15)
-        - R * math.log(P_Pa / 101325.0)
-    ) / 1000.0 / MW_NH3
-
-    # A compact EOS correction based on Z.
-    Z = z_factor(T_K, P_Pa, phase)
-    s_dep = R * math.log(max(Z, 1e-12)) / 1000.0 / MW_NH3
-    return s_ideal + s_dep
+def compressibility(T, P, phase="vapor"):
+    roots = pr_roots(T, P)
+    return roots[-1] if phase == "vapor" else roots[0]
 
 
-def saturation_state(T_C):
-    P = psat_nh3(T_C) / 1000.0
-    hf = nh3_enthalpy(T_C, P, "liquid")
-    hg = nh3_enthalpy(T_C, P, "vapor")
-    return {"P_kPa": P, "h_f": hf, "h_g": hg, "h_fg": hg - hf}
+def ideal_cp_ammonia(T):
+    return 35.0 + 0.025 * (T - 273.15)
+
+
+def ideal_enthalpy(T, Tref=273.15):
+    dT = T - Tref
+    return 35.0 * dT + 0.0125 * dT**2
+
+
+def ideal_entropy(T, Tref=273.15):
+    return (
+        35.0 * math.log(T / Tref)
+        + 0.025 * (T - Tref - Tref * math.log(T / Tref))
+    )
+
+
+def departure(T, P, phase="vapor"):
+    a, b = pr_parameters(T)
+    Z = compressibility(T, P, phase)
+    B = b * P / (R * T)
+
+    dT = max(1e-3, T * 1e-5)
+    da_dT = (
+        pr_parameters(T + dT)[0]
+        - pr_parameters(T - dT)[0]
+    ) / (2 * dT)
+
+    s2 = math.sqrt(2)
+    logterm = math.log(
+        (Z + (1 + s2) * B)
+        / (Z + (1 - s2) * B)
+    )
+
+    hres = (
+        R * T * (Z - 1)
+        + (T * da_dT - a) / (2 * s2 * b) * logterm
+    )
+
+    sres = (
+        R * math.log(Z - B)
+        + da_dT / (2 * s2 * b) * logterm
+    )
+
+    return hres, sres
+
+
+def enthalpy(T, P, phase="vapor"):
+    return (
+        ideal_enthalpy(T) + departure(T, P, phase)[0]
+    ) / MW / 1000.0
+
+
+def entropy(T, P, phase="vapor"):
+    return (
+        ideal_entropy(T)
+        - R * math.log(P / 101325.0)
+        + departure(T, P, phase)[1]
+    ) / MW / 1000.0
