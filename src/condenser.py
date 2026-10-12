@@ -1,80 +1,153 @@
-"""Condenser sizing and off-design routines."""
+"""Task 2: seasonal condenser comparison and preliminary sizing."""
 
+import csv
 import math
-from dataclasses import dataclass
-from .psychrometrics import saturation_pressure_water, wet_bulb_temperature
-from .absorption_cycle import cycle_performance
+from pathlib import Path
+
+from src.psychrometrics import wet_bulb_temperature
+from src.absorption_cycle import (
+    solve_cycle,
+    required_generator_temperature,
+)
+
+U_AIR = 30.0
+U_EVAP = 600.0
+
+AMBIENT = {
+    "Summer day": (40.0, 0.50),
+    "Summer night": (30.0, 0.50),
+    "Monsoon day": (35.0, 0.85),
+    "Monsoon night": (30.0, 0.85),
+    "Winter day": (28.0, 0.50),
+    "Winter night": (16.0, 0.50),
+}
 
 
-@dataclass
-class CondenserDesign:
-    kind: str
-    governing_condition: str
-    approach_K: float
-    U_W_m2K: float
-    area_m2: float
-    UA_W_K: float
-    heat_duty_kW: float
-
-
-def lmtd(delta1, delta2):
-    if delta1 <= 0 or delta2 <= 0:
+def calculate_lmtd(dT1, dT2):
+    if dT1 <= 0 or dT2 <= 0:
         raise ValueError("Temperature differences must be positive.")
-    if abs(delta1 - delta2) < 1e-9:
-        return delta1
-    return (delta1 - delta2) / math.log(delta1 / delta2)
+
+    if math.isclose(dT1, dT2, rel_tol=1e-9):
+        return dT1
+
+    return (dT1 - dT2) / math.log(dT1 / dT2)
 
 
-def compare_condenser_types(conditions, Q_by_condition):
+def size_condenser(
+    Q_kW,
+    sink_in_C,
+    approach_K,
+    U_W_m2K,
+    cp_kJ_kgK,
+    sink_rise_K,
+):
+    if Q_kW <= 0:
+        raise ValueError("Heat duty must be positive.")
+
+    if approach_K <= sink_rise_K:
+        raise ValueError("Approach must exceed sink temperature rise.")
+
+    T_cond = sink_in_C + approach_K
+    T_out = sink_in_C + sink_rise_K
+
+    LMTD = calculate_lmtd(
+        T_cond - sink_in_C,
+        T_cond - T_out,
+    )
+
+    UA = Q_kW * 1000.0 / LMTD
+    area = UA / U_W_m2K
+    mass_flow = Q_kW / (cp_kJ_kgK * sink_rise_K)
+
+    return {
+        "T_cond_C": T_cond,
+        "T_sink_out_C": T_out,
+        "LMTD_K": LMTD,
+        "UA_W_K": UA,
+        "area_m2": area,
+        "cooling_flow_kg_s": mass_flow,
+    }
+
+
+def compare_condensers(Q_evap_kW=5000.0):
+    """Compare both condenser types at the six ambient conditions."""
     rows = []
-    for c in conditions:
-        twb = wet_bulb_temperature(c["Tdb_C"], c["RH"])
-        q = Q_by_condition[c["name"]]
-        # Representative sizing approaches requested by the project.
-        Tcond_air = c["Tdb_C"] + 12.0
-        Tcond_evap = twb + 8.0
 
-        dt_air = max(Tcond_air - c["Tdb_C"], 1.0)
-        dt_evap = max(Tcond_evap - twb, 1.0)
+    for name, (T_db, RH) in AMBIENT.items():
+        T_wb = wet_bulb_temperature(T_db, RH)
 
-        rows.append({
-            "condition": c["name"],
-            "Tdb_C": c["Tdb_C"],
-            "Twb_C": twb,
-            "Q_kW": q,
-            "A_air_m2": q * 1000.0 / (30.0 * dt_air),
-            "A_evap_m2": q * 1000.0 / (600.0 * dt_evap),
-        })
+        options = {
+            "air": size_condenser(
+                Q_evap_kW, T_db, 12.0, U_AIR, 1.006, 10.0
+            ),
+            "evaporative": size_condenser(
+                Q_evap_kW, T_wb, 8.0, U_EVAP, 4.186, 5.0
+            ),
+        }
+
+        for condenser_type, design in options.items():
+            try:
+                cycle = solve_cycle(
+                    Q_evap_kW,
+                    T_cond_C=design["T_cond_C"],
+                )
+
+                design.update({
+                    "Q_gen_kW": cycle.Q_gen_kW,
+                    "Q_cond_kW": cycle.Q_cond_kW,
+                    "COP": cycle.COP,
+                    "P_high_bar": cycle.P_high_bar,
+                    "T_gen_required_C":
+                        required_generator_temperature(cycle.P_high_bar),
+                    "pressure_ok": cycle.P_high_bar <= 20.0,
+                    "minimum_Tcond_ok":
+                        design["T_cond_C"] >= 25.0,
+                })
+
+            except (ValueError, OverflowError):
+                design.update({
+                    "Q_gen_kW": None,
+                    "Q_cond_kW": None,
+                    "COP": None,
+                    "P_high_bar": None,
+                    "T_gen_required_C": None,
+                    "pressure_ok": False,
+                    "minimum_Tcond_ok":
+                        design["T_cond_C"] >= 25.0,
+                })
+
+            rows.append({
+                "condition": name,
+                "condenser_type": condenser_type,
+                "T_db_C": T_db,
+                "RH_percent": RH * 100.0,
+                "T_wb_C": T_wb,
+                **design,
+            })
+
     return rows
 
 
-def size_condenser(kind, governing, Q_kW, Tdb_C, Twb_C,
-                   approach_K):
-    if kind == "air":
-        U = 30.0
-        T_sink = Tdb_C
-    elif kind == "evaporative":
-        U = 600.0
-        T_sink = Twb_C
-    else:
-        raise ValueError("kind must be 'air' or 'evaporative'")
+def save_results(rows, filename="results/tables/condenser_task2.csv"):
+    path = Path(filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    Tcond = T_sink + approach_K
-    # Simple condensing-side LMTD with an assumed 5 K cooling-medium rise.
-    dt1 = Tcond - T_sink
-    dt2 = Tcond - (T_sink + 5.0)
-    if dt2 <= 0:
-        dt2 = dt1
-    L = lmtd(dt1, dt2)
-    UA = Q_kW * 1000.0 / L
-    A = UA / U
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
 
-    return CondenserDesign(
-        kind=kind,
-        governing_condition=governing,
-        approach_K=approach_K,
-        U_W_m2K=U,
-        area_m2=A,
-        UA_W_K=UA,
-        heat_duty_kW=Q_kW,
-    )
+    print(f"Saved results to {path}")
+
+
+if __name__ == "__main__":
+    rows = compare_condensers()
+    save_results(rows)
+
+    for row in rows:
+        print(
+            row["condition"],
+            row["condenser_type"],
+            "area =", round(row["area_m2"], 2), "m2",
+            "LMTD =", round(row["LMTD_K"], 2), "K",
+        )
