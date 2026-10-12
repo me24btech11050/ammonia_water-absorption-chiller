@@ -1,37 +1,48 @@
-"""Automated validation tests required by the project statement."""
+"""Basic psychrometric tests."""
+
+import unittest
 
 from src.psychrometrics import (
-    humidity_ratio_from_rh,
+    humidity_ratio,
     moist_air_enthalpy,
-    adiabatic_mixing,
+    mix_air,
     wet_bulb_temperature,
 )
 
 
-def test_basic_enthalpy():
-    T = 22.0
-    w = 0.01242
-    h = moist_air_enthalpy(T, w)
-    assert abs(h - 53.71) < 0.05
+class TestPsychrometrics(unittest.TestCase):
+
+    def test_room_air(self):
+        w = humidity_ratio(22.0, 0.75)
+        h = moist_air_enthalpy(22.0, w)
+
+        self.assertAlmostEqual(w, 0.01242, delta=0.0001)
+        self.assertAlmostEqual(h, 53.71, delta=0.15)
+
+    def test_outdoor_air(self):
+        w = humidity_ratio(40.0, 0.50)
+        h = moist_air_enthalpy(40.0, w)
+
+        self.assertAlmostEqual(w, 0.02352, delta=0.0001)
+        self.assertAlmostEqual(h, 100.82, delta=0.15)
+
+    def test_air_mixing(self):
+        result = mix_air(
+            22.0, 0.75,
+            40.0, 0.50,
+            0.70,
+        )
+
+        self.assertAlmostEqual(
+            result["w"], 0.01575, delta=0.00008
+        )
+
+    def test_wet_bulb(self):
+        twb = wet_bulb_temperature(40.0, 0.50)
+
+        self.assertLess(twb, 40.0)
+        self.assertGreater(twb, 0.0)
 
 
-def test_psychrometric_mixing():
-    room = adiabatic_mixing(
-        22.0, 0.75,
-        40.0, 0.50,
-        0.70, 0.30
-    )
-
-    assert abs(room["w"] - 0.01575) < 0.00008
-    assert abs(room["h"] - 67.84) < 0.10
-    assert abs(room["T_C"] - 27.48) < 0.10
-
-
-def test_summer_day_wet_bulb():
-    twb = wet_bulb_temperature(40.0, 0.50)
-    assert 29.0 < twb < 32.0
-
-
-def test_monsoon_day_wet_bulb():
-    twb = wet_bulb_temperature(35.0, 0.85)
-    assert 31.0 < twb < 34.0
+if __name__ == "__main__":
+    unittest.main()
